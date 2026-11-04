@@ -610,7 +610,7 @@ function Lib:Window(opts)
     return win
 end
 
-function self._lib:_MakeTabAPI(page)
+function Lib:_MakeTabAPI(page)
     local tab = {Frame = page, Lib = self}
 
     function tab:Section(name, opts)
@@ -640,7 +640,6 @@ function self._lib:_MakeTabAPI(page)
     function tab:NumberInput(o)   return self.Lib:_NumberInput(page, o) end
     function tab:SearchInput(o)   return self.Lib:_SearchInput(page, o) end
     function tab:Keybind(o)       return self.Lib:_Keybind(page, o) end
-    
     function tab:ColorPicker(o)   return self.Lib:_ColorPicker(page, o) end
     function tab:Label(o)         return self.Lib:_Label(page, o) end
     function tab:Paragraph(o)     return self.Lib:_Paragraph(page, o) end
@@ -2114,7 +2113,7 @@ function Lib:_ColorPicker(parent, o)
         BackgroundColor3 = Color3.new(1, 1, 1),
         BorderSizePixel = 0,
     }, hsv)
-    local satGrad = inst("UIGradient", {
+    inst("UIGradient", {
         Color = ColorSequence.new({
             ColorSequenceKeypoint.new(0, Color3.new(1, 1, 1)),
             ColorSequenceKeypoint.new(1, Color3.new(1, 1, 1)),

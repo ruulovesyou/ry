@@ -1,7 +1,6 @@
-
 --[[
-    Neutral UI — v2.1
-    Same public API as v1/v2. Stability + responsive UX refinement.
+    Neutral UI — v2.2
+    Same public API as v1/v2. Reliability and interaction fixes.
 
     Theme: edit Lib.Theme (flat table) before calling Lib.new / :Window.
     Canonical usage:
@@ -16,6 +15,7 @@ local TS  = game:GetService("TweenService")
 local UIS = game:GetService("UserInputService")
 local HS  = game:GetService("HttpService")
 local GS  = game:GetService("GuiService")
+local Players = game:GetService("Players")
 
 local Lib = {}
 Lib.__index = Lib
@@ -254,6 +254,7 @@ function Lib:SetFlag(name, value)
     if sigs and prev ~= value then
         -- Dispatch in order: asynchronous notifications can apply stale values.
         for _, fn in ipairs(table.clone(sigs)) do
+            if self._flags[name] ~= value then break end
             local ok, err = pcall(fn, value)
             if not ok then warn("[Neutral UI flag]", name, err) end
         end
@@ -320,9 +321,19 @@ local function decode(v)
 end
 
 -- config ----------------------------------------------------------------
+local function configName(name)
+    -- Config names are filenames, never arbitrary filesystem paths.
+    name = tostring(name or "default")
+    if name == "" or #name > 64 or not name:match("^[%w_%-]+$") then
+        return nil
+    end
+    return name
+end
+
 function Lib:SaveConfig(name)
-    name = name or "default"
-    if not writefile then return end
+    name = configName(name)
+    if not name then warn("[Neutral UI] Invalid config name"); return false end
+    if not writefile then return false end
     if makefolder and isfolder and not isfolder(self.Folder) then
         pcall(makefolder, self.Folder)
     end
@@ -342,27 +353,35 @@ function Lib:SaveConfig(name)
     else
         self:Notify({Title = "Config save failed", Body = name, Type = "error"})
     end
+    return ok
 end
 
 function Lib:LoadConfig(name)
-    name = name or "default"
-    if not readfile then return end
+    name = configName(name)
+    if not name then warn("[Neutral UI] Invalid config name"); return false end
+    if not readfile then return false end
     local ok, data = pcall(function()
         return HS:JSONDecode(readfile(self.Folder .. "/" .. name .. ".json"))
     end)
     if not ok or type(data) ~= "table" then
         self:Notify({Title = "Config load failed", Body = name, Type = "error"})
-        return
+        return false
     end
-    for k, v in pairs(data) do self:SetFlag(k, decode(v)) end
+    for k, v in pairs(data) do
+        if type(k) == "string" then self:SetFlag(k, decode(v)) end
+    end
     self:Notify({Title = "Config loaded", Body = name, Type = "success"})
+    return true
 end
 
 function Lib:DeleteConfig(name)
-    name = name or "default"
-    if not delfile then return end
-    pcall(function() delfile(self.Folder .. "/" .. name .. ".json") end)
-    self:Notify({Title = "Config deleted", Body = name, Type = "warn"})
+    name = configName(name)
+    if not name then warn("[Neutral UI] Invalid config name"); return false end
+    if not delfile then return false end
+    local ok = pcall(function() delfile(self.Folder .. "/" .. name .. ".json") end)
+    self:Notify({Title = ok and "Config deleted" or "Config delete failed", Body = name,
+        Type = ok and "success" or "error"})
+    return ok
 end
 
 function Lib:ListConfigs()
@@ -378,10 +397,32 @@ function Lib:ListConfigs()
     return out
 end
 
+-- overlays --------------------------------------------------------------
+local function guiParent()
+    if type(gethui) == "function" then
+        local ok, parent = pcall(gethui)
+        if ok and parent then return parent end
+    end
+    local player = Players.LocalPlayer
+    if player then return player:WaitForChild("PlayerGui") end
+    error("[Neutral UI] This library must run on the client (LocalScript).", 2)
+end
+
+function Lib:_OverlayGui()
+    if self._overlayGui and self._overlayGui.Parent then return self._overlayGui end
+    local gui = inst("ScreenGui", {
+        Name = self.Name .. "_Overlays", ResetOnSpawn = false,
+        IgnoreGuiInset = true, DisplayOrder = 100,
+        ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+    }, guiParent())
+    self._overlayGui = gui
+    return gui
+end
+
 -- notifications ---------------------------------------------------------
 function Lib:_EnsureNotifStack()
     if self._notifStack and self._notifStack.Parent then return end
-    local par = self._gui or (gethui and gethui()) or game:GetService("CoreGui")
+    local par = self:_OverlayGui()
     self._notifStack = inst("Frame", {
         Name = "Notifications",
         AnchorPoint = Vector2.new(1, 1),
@@ -444,7 +485,7 @@ end
 function Lib:Dialog(opts)
     opts = opts or {}
     local T = self.Theme
-    local par = self._gui or (gethui and gethui()) or game:GetService("CoreGui")
+    local par = self:_OverlayGui()
 
     local overlay = inst("Frame", {
         Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1,
@@ -514,10 +555,20 @@ function Lib:Dialog(opts)
     overlay.Destroying:Connect(function()
         if escConn then escConn:Disconnect(); escConn = nil end
     end)
+    local dismissed = false
+    local previousSelection = GS.SelectedObject
     local function dismiss(cb)
-        if escConn then escConn:Disconnect() end
+        if dismissed then return end
+        dismissed = true
+        if escConn then escConn:Disconnect(); escConn = nil end
+        if GS.SelectedObject == cancel or GS.SelectedObject == confirm then
+            GS.SelectedObject = previousSelection
+        end
         if overlay.Parent then overlay:Destroy() end
-        if cb then pcall(cb) end
+        if cb then
+            local ok, err = pcall(cb)
+            if not ok then warn("[Neutral UI dialog]", err) end
+        end
     end
     confirm.MouseButton1Click:Connect(function() dismiss(opts.OnConfirm) end)
     cancel.MouseButton1Click:Connect(function() dismiss(opts.OnCancel) end)
@@ -539,7 +590,7 @@ function Lib:Window(opts)
     local win = {_lib = self, _tabs = {}, _conns = {}, _active = nil}
     local cam = workspace.CurrentCamera
     local W, H = opts.Width or 640, opts.Height or 460
-    local guiPar = (gethui and gethui()) or game:GetService("CoreGui")
+    local guiPar = guiParent()
 
     local gui = inst("ScreenGui", {
         Name = self.Name, ResetOnSpawn = false, IgnoreGuiInset = true,
@@ -608,10 +659,10 @@ function Lib:Window(opts)
 
     local function layout()
         local vx, vy = cam.ViewportSize.X, cam.ViewportSize.Y
-        compact = vx < T.compactBelow
-        -- Clamp on every viewport, not only compact screens.
-        local width = math.min(W, math.max(180, vx - 24))
-        local height = math.min(H, math.max(T.headerH + 96, vy - 24))
+        -- Clamp first; compact navigation depends on actual window width too.
+        local width = math.min(W, math.max(1, vx - 24))
+        compact = vx < T.compactBelow or width < 520
+        local height = math.min(H, math.max(T.headerH, vy - 24))
         root.Size = UDim2.fromOffset(width, collapsed and T.headerH or height)
 
         local top = T.headerH
@@ -660,6 +711,16 @@ function Lib:Window(opts)
         content.Visible = show
         divider.Visible = show and not compact
         if statusBar then statusBar.Visible = show end
+        -- Viewport changes must not leave the window unreachable.
+        if vx > 0 and vy > 0 then
+            local x = vx * root.Position.X.Scale + root.Position.X.Offset
+            local y = vy * root.Position.Y.Scale + root.Position.Y.Offset
+            local halfW = width / 2
+            root.Position = UDim2.fromOffset(
+                math.clamp(x, 48 - halfW, vx - 48 + halfW),
+                math.clamp(y, T.headerH / 2, math.max(T.headerH / 2, vy - T.headerH / 2))
+            )
+        end
     end
 
     -- Drag by the header; keep the header reachable and track the active touch.
@@ -724,6 +785,9 @@ function Lib:Window(opts)
         end
     end
     btnClose.MouseButton1Click:Connect(function() win:Close() end)
+    conn(win._conns, gui.Destroying, function()
+        if win._gui then win:Close() end
+    end)
 
     function win:SetVisible(v) self._root.Visible = v ~= false end
 
@@ -749,14 +813,24 @@ function Lib:Window(opts)
     end
 
     function win:SelectTab(name)
+        local found = false
+        for _, e in ipairs(self._tabs) do
+            if e.name == name then found = true end
+        end
+        if not found then return false end
+        if self._active ~= name then content.CanvasPosition = Vector2.zero end
         for _, e in ipairs(self._tabs) do
             e.on = e.name == name
             e.paint()
         end
         self._active = name
+        return true
     end
 
     function win:Tab(name, icon)
+        for _, existing in ipairs(self._tabs) do
+            if existing.name == name then return lib:_MakeAPI(existing.page) end
+        end
         local page = inst("Frame", {
             Name = name, Size = UDim2.new(1, 0, 0, 0),
             AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1, Visible = false,
@@ -818,6 +892,14 @@ function Lib:CloseAll()
         if w.Close then pcall(function() w:Close() end) end
     end
     self._windows = {}
+end
+
+function Lib:Destroy()
+    self:CloseAll()
+    for _, element in pairs(table.clone(self._elements or {})) do element:Destroy() end
+    if self._overlayGui then self._overlayGui:Destroy(); self._overlayGui = nil end
+    self._notifStack = nil
+    table.clear(self._flagSigs)
 end
 
 -- API builder: tabs and sections share one method set ------------------
@@ -1029,20 +1111,25 @@ function Lib:_Element(frame, opts, internal)
         local nodes = {frame}
         for _, d in ipairs(frame:GetDescendants()) do table.insert(nodes, d) end
         for _, d in ipairs(nodes) do
-            local original = self._originalStates[d]
-            if locked then
-                original = {
-                    Active = d.Active,
-                    TextTransparency = (d:IsA("TextLabel") or d:IsA("TextButton")) and d.TextTransparency or nil,
-                }
-                self._originalStates[d] = original
-            end
-            if d:IsA("GuiButton") or d:IsA("TextBox") then
-                if locked then d.Active = false
-                elseif original then d.Active = original.Active end
-            end
-            if d:IsA("TextLabel") or d:IsA("TextButton") then
-                d.TextTransparency = locked and 0.5 or (original and original.TextTransparency or 0)
+            -- UICorner, UIStroke, and layouts do not expose GuiObject properties.
+            if d:IsA("GuiObject") then
+                local original = self._originalStates[d]
+                if locked then
+                    original = {
+                        Active = d.Active,
+                        Selectable = d.Selectable,
+                        TextTransparency = (d:IsA("TextLabel") or d:IsA("TextButton"))
+                            and d.TextTransparency or nil,
+                    }
+                    self._originalStates[d] = original
+                end
+                if d:IsA("GuiButton") or d:IsA("TextBox") then
+                    if locked then d.Active = false; d.Selectable = false
+                    elseif original then d.Active = original.Active; d.Selectable = original.Selectable end
+                end
+                if d:IsA("TextLabel") or d:IsA("TextButton") then
+                    d.TextTransparency = locked and 0.5 or (original and original.TextTransparency or 0)
+                end
             end
         end
         if not locked then self._originalStates = {} end
@@ -1466,8 +1553,11 @@ function Lib:_Slider(parent, o)
     local lib = self
     local flag = o.Flag or o.Id
     local mn, mx, step = o.Min or 0, o.Max or 100, o.Step or 1
+    if mx < mn then mn, mx = mx, mn end
+    if step <= 0 then step = 1 end
     local suffix = o.Suffix or ""
-    local val = math.clamp(lib:_GetInitial(flag, o.Default or mn), mn, mx)
+    local initial = lib:_GetInitial(flag, o.Default ~= nil and o.Default or mn)
+    local val = math.clamp(type(initial) == "number" and initial or mn, mn, mx)
     local bag = {}
 
     local box = inst("Frame", {
@@ -1515,7 +1605,8 @@ function Lib:_Slider(parent, o)
     end
 
     local function setVal(v, fromFlag)
-        v = math.clamp(math.floor(v / step + 0.5) * step, mn, mx)
+        if type(v) ~= "number" or v ~= v then return end
+        v = math.clamp(mn + math.floor((v - mn) / step + 0.5) * step, mn, mx)
         if v == val then return end
         val = v
         paint()
@@ -1523,7 +1614,7 @@ function Lib:_Slider(parent, o)
         if o.Callback then pcall(o.Callback, val) end
     end
 
-    local dragging, focused = false, false
+    local dragInput, focused = nil, false
     local function fromInput(i)
         if track.AbsoluteSize.X <= 0 then return end
         local r = math.clamp((i.Position.X - track.AbsolutePosition.X) / track.AbsoluteSize.X, 0, 1)
@@ -1531,13 +1622,17 @@ function Lib:_Slider(parent, o)
     end
 
     hit.InputBegan:Connect(function(i)
-        if isPress(i) then dragging = true; fromInput(i) end
+        if isPress(i) and not dragInput then dragInput = i; fromInput(i) end
     end)
     conn(bag, UIS.InputChanged, function(i)
-        if dragging and isMove(i) then fromInput(i) end
+        if dragInput and (i == dragInput or
+            (dragInput.UserInputType == Enum.UserInputType.MouseButton1 and
+                i.UserInputType == Enum.UserInputType.MouseMovement)) then
+            fromInput(i)
+        end
     end)
     conn(bag, UIS.InputEnded, function(i)
-        if isPress(i) then dragging = false end
+        if dragInput and i == dragInput then dragInput = nil end
     end)
     conn(bag, hit.SelectionGained, function() focused = true end)
     conn(bag, hit.SelectionLost, function() focused = false end)
@@ -1572,6 +1667,8 @@ function Lib:_RangeSlider(parent, o)
     local lib = self
     local flag = o.Flag or o.Id
     local mn, mx, step = o.Min or 0, o.Max or 100, o.Step or 1
+    if mx < mn then mn, mx = mx, mn end
+    if step <= 0 then step = 1 end
     local bag = {}
 
     local saved = flag and lib:GetFlag(flag)
@@ -1616,7 +1713,8 @@ function Lib:_RangeSlider(parent, o)
     local kLo, kHi = mkKnob(), mkKnob()
 
     local function snap(v)
-        v = math.floor(v / step + 0.5) * step
+        if type(v) ~= "number" or v ~= v then return mn end
+        v = mn + math.floor((v - mn) / step + 0.5) * step
         return math.clamp(v, mn, mx)
     end
 
@@ -1638,13 +1736,11 @@ function Lib:_RangeSlider(parent, o)
         if l == lo and h == hi then return end
         lo, hi = l, h
         paint()
-        if not fromFlag then
-            if flag then lib:SetFlag(flag, {lo, hi}) end
-            if o.Callback then pcall(o.Callback, lo, hi) end
-        end
+        if flag and not fromFlag then lib:SetFlag(flag, {lo, hi}) end
+        if o.Callback then pcall(o.Callback, lo, hi) end
     end
 
-    local active
+    local active, dragInput
     local function fromInput(i)
         if track.AbsoluteSize.X <= 0 then return end
         local r = math.clamp((i.Position.X - track.AbsolutePosition.X) / track.AbsoluteSize.X, 0, 1)
@@ -1662,7 +1758,7 @@ function Lib:_RangeSlider(parent, o)
         }, k)
         focusRing(h, bag)
         h.InputBegan:Connect(function(i)
-            if isPress(i) then active = which; fromInput(i) end
+            if isPress(i) and not dragInput then active, dragInput = which, i; fromInput(i) end
         end)
         return h
     end
@@ -1670,10 +1766,14 @@ function Lib:_RangeSlider(parent, o)
     hitFor(kHi, "hi")
 
     conn(bag, UIS.InputChanged, function(i)
-        if active and isMove(i) then fromInput(i) end
+        if active and dragInput and (i == dragInput or
+            (dragInput.UserInputType == Enum.UserInputType.MouseButton1 and
+                i.UserInputType == Enum.UserInputType.MouseMovement)) then
+            fromInput(i)
+        end
     end)
     conn(bag, UIS.InputEnded, function(i)
-        if isPress(i) then active = nil end
+        if i == dragInput then active, dragInput = nil, nil end
     end)
 
     if flag then
@@ -1701,7 +1801,10 @@ function Lib:_Stepper(parent, o)
     local flag = o.Flag or o.Id
     local mn, mx, step = o.Min or 0, o.Max or 100, o.Step or 1
     local suffix = o.Suffix or ""
-    local val = math.clamp(lib:_GetInitial(flag, o.Default ~= nil and o.Default or mn), mn, mx)
+    if mx < mn then mn, mx = mx, mn end
+    if step <= 0 then step = 1 end
+    local initial = lib:_GetInitial(flag, o.Default ~= nil and o.Default or mn)
+    local val = math.clamp(type(initial) == "number" and initial or mn, mn, mx)
     local bag = {}
 
     local row = inst("Frame", {
@@ -1715,7 +1818,6 @@ function Lib:_Stepper(parent, o)
     })
 
     local minus = iconBtn(row, UDim2.new(1, -144, 0.5, -14), "−")
-    minus.Parent.Name = minus.Parent.Name
     local chip = inst("TextLabel", {
         Size = UDim2.fromOffset(64, 24), Position = UDim2.new(1, -110, 0.5, -12),
         BackgroundColor3 = T.sunken, BorderSizePixel = 0,
@@ -1732,6 +1834,7 @@ function Lib:_Stepper(parent, o)
     end
 
     local function setVal(v, fromFlag)
+        if type(v) ~= "number" or v ~= v then return end
         v = math.clamp(v, mn, mx)
         if v == val then return end
         val = v
@@ -1793,7 +1896,7 @@ function Lib:_Dropdown(parent, o)
     local valLbl = text(box, {
         Size = UDim2.new(0.58, -(T.md + 22), 1, 0), Position = UDim2.new(0.42, 0, 0, 0),
         Font = T.fm, TextXAlignment = Enum.TextXAlignment.Right,
-        TruncateEnd = nil, ZIndex = 3,
+        ZIndex = 3,
     })
     valLbl.TextTruncate = Enum.TextTruncate.AtEnd
     local chev = text(box, {
@@ -1874,10 +1977,10 @@ function Lib:_Dropdown(parent, o)
         end
         paint()
         if open then rebuild(searchBox and searchBox.Text or "") end
-        if not fromFlag then
-            if flag then lib:SetFlag(flag, multi and table.clone(current) or current) end
-            if o.Callback then pcall(o.Callback, multi and table.clone(current) or current) end
+        if flag and not fromFlag then
+            lib:SetFlag(flag, multi and table.clone(current) or current)
         end
+        if o.Callback then pcall(o.Callback, multi and table.clone(current) or current) end
     end
 
     local function resize()
@@ -2036,7 +2139,10 @@ function Lib:_Textbox(parent, o)
 
     if flag then
         observeFlag(lib, flag, bag, function(v)
-            if type(v) == "string" and v ~= tb.Text then tb.Text = v end
+            if type(v) == "string" and v ~= tb.Text then
+                tb.Text = v
+                if o.Callback then pcall(o.Callback, v) end
+            end
         end)
     end
 
@@ -2095,15 +2201,16 @@ function Lib:_NumberInput(parent, o)
     tb.FocusLost:Connect(function()
         focused = false
         local n = tonumber(tb.Text)
-        if not n then
+        if not n or n ~= n then
             setStatus("error", "Enter a number")
             return
         end
         if o.Min then n = math.max(o.Min, n) end
         if o.Max then n = math.min(o.Max, n) end
         tb.Text = tostring(n)
-        lastValid = n
         setStatus(nil)
+        if n == lastValid then return end
+        lastValid = n
         if flag then lib:SetFlag(flag, n) end
         if o.Callback then pcall(o.Callback, n) end
     end)
@@ -2113,6 +2220,7 @@ function Lib:_NumberInput(parent, o)
             if type(v) == "number" and v ~= lastValid then
                 lastValid = v
                 tb.Text = tostring(v)
+                if o.Callback then pcall(o.Callback, v) end
             end
         end)
     end
@@ -2178,7 +2286,8 @@ function Lib:_Keybind(parent, o)
     local lib = self
     local flag = o.Flag or o.Id
     local mode = o.Mode or "tap"
-    local key = o.Default
+    local key = typeof(o.Default) == "EnumItem" and o.Default
+        or keyFromName(o.Default)
 
     local existing = flag and lib:GetFlag(flag)
     if type(existing) == "string" then
@@ -2223,7 +2332,18 @@ function Lib:_Keybind(parent, o)
     end
 
     chip.MouseButton1Click:Connect(function()
-        listening = not listening
+        if listening then
+            listening = false
+            if lib._listeningKeybind == chip then lib._listeningKeybind = nil end
+        else
+            if lib._cancelKeyCapture then lib._cancelKeyCapture() end
+            listening = true
+            lib._listeningKeybind = chip
+            lib._cancelKeyCapture = function()
+                listening = false
+                paintChip()
+            end
+        end
         paintChip()
     end)
 
@@ -2231,17 +2351,23 @@ function Lib:_Keybind(parent, o)
         if listening then
             if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
             listening = false
+            lib._cancelKeyCapture = nil
+            lib._listeningKeybind = nil
             if input.KeyCode == Enum.KeyCode.Escape then
                 paintChip()
                 return
             end
-            key = input.KeyCode
-            if flag then lib:SetFlag(flag, key.Name) end
+            if input.KeyCode == Enum.KeyCode.Backspace or input.KeyCode == Enum.KeyCode.Delete then
+                key = nil
+            else
+                key = input.KeyCode
+            end
+            if flag then lib:SetFlag(flag, key and key.Name or "None") end
             if o.Callback then pcall(o.Callback, key, false) end
             paintChip()
             return
         end
-        if key and input.KeyCode == key and not gp then
+        if key and input.KeyCode == key and not gp and not UIS:GetFocusedTextBox() then
             if o.Callback then pcall(o.Callback, key, true) end
         end
     end)
@@ -2256,21 +2382,30 @@ function Lib:_Keybind(parent, o)
     if flag then
         observeFlag(lib, flag, bag, function(v)
             local k = keyFromName(v)
-            if k then key = k; paintChip() end
+            if (k or v == "None") and k ~= key then
+                key = k; paintChip()
+                if o.Callback then pcall(o.Callback, key, false) end
+            end
         end)
     end
     paintChip()
 
+    table.insert(bag, {Disconnect = function()
+        if lib._listeningKeybind == chip then
+            lib._listeningKeybind = nil
+            lib._cancelKeyCapture = nil
+        end
+    end})
     return self:_Element(row, o, {
         conns = bag,
         get = function() return key end,
         set = function(v)
             local nextKey = typeof(v) == "EnumItem" and v
                 or (type(v) == "string" and keyFromName(v) or nil)
-            if not nextKey or nextKey == key then return end
+            if nextKey == key then return end
             key = nextKey
             paintChip()
-            if flag then lib:SetFlag(flag, key.Name) end
+            if flag then lib:SetFlag(flag, key and key.Name or "None") end
             if o.Callback then pcall(o.Callback, key, false) end
         end,
         refresh = paintChip,
@@ -2368,29 +2503,33 @@ function Lib:_ColorPicker(parent, o)
         end
     end
 
-    local drag
+    local drag, dragInput
     local function fromSV(i)
+        if sv.AbsoluteSize.X <= 0 or sv.AbsoluteSize.Y <= 0 then return end
         sat = math.clamp((i.Position.X - sv.AbsolutePosition.X) / sv.AbsoluteSize.X, 0, 1)
         val = 1 - math.clamp((i.Position.Y - sv.AbsolutePosition.Y) / sv.AbsoluteSize.Y, 0, 1)
         paint()
     end
     local function fromHue(i)
+        if hueBar.AbsoluteSize.X <= 0 then return end
         hue = math.clamp((i.Position.X - hueBar.AbsolutePosition.X) / hueBar.AbsoluteSize.X, 0, 1)
         paint()
     end
     sv.InputBegan:Connect(function(i)
-        if isPress(i) then drag = "sv"; fromSV(i) end
+        if isPress(i) and not dragInput then drag, dragInput = "sv", i; fromSV(i) end
     end)
     hueBar.InputBegan:Connect(function(i)
-        if isPress(i) then drag = "hue"; fromHue(i) end
+        if isPress(i) and not dragInput then drag, dragInput = "hue", i; fromHue(i) end
     end)
     conn(bag, UIS.InputChanged, function(i)
-        if drag and isMove(i) then
+        if drag and dragInput and (i == dragInput or
+            (dragInput.UserInputType == Enum.UserInputType.MouseButton1 and
+                i.UserInputType == Enum.UserInputType.MouseMovement)) then
             if drag == "sv" then fromSV(i) else fromHue(i) end
         end
     end)
     conn(bag, UIS.InputEnded, function(i)
-        if isPress(i) then drag = nil end
+        if i == dragInput then drag, dragInput = nil, nil end
     end)
 
     paint(true)
@@ -2399,6 +2538,7 @@ function Lib:_ColorPicker(parent, o)
             if typeof(c) == "Color3" and c ~= cur then
                 hue, sat, val = Color3.toHSV(c)
                 paint(true)
+                if o.Callback then pcall(o.Callback, cur) end
             end
         end)
     end
@@ -2445,15 +2585,18 @@ function Lib:_ProgressBar(parent, o)
     }, bg)
     corner(fill, UDim.new(1, 0))
 
+    local value = 0
     local function set(v)
-        v = math.clamp(v or 0, 0, 1)
+        if type(v) ~= "number" or v ~= v then return end
+        v = math.clamp(v, 0, 1)
+        value = v
         tw(fill, {Size = UDim2.new(v, 0, 1, 0)})
         if pct then pct.Text = math.floor(v * 100 + 0.5) .. "%" end
     end
     set(o.Default or 0)
 
     return self:_Element(wrap, o, {
-        get = function() return fill.Size.X.Scale end,
+        get = function() return value end,
         set = set,
     })
 end
@@ -2487,4 +2630,3 @@ function Lib:_CodeViewer(parent, o)
 end
 
 return Lib
-

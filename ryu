@@ -1,6 +1,7 @@
+
 --[[
-    Neutral UI — v2
-    Same public API as v1. Rebuilt from a token layer up.
+    Neutral UI — v2.1
+    Same public API as v1/v2. Stability + responsive UX refinement.
 
     Theme: edit Lib.Theme (flat table) before calling Lib.new / :Window.
     Canonical usage:
@@ -54,7 +55,7 @@ Lib.Theme = {
     fm    = Enum.Font.GothamMedium,
     fb    = Enum.Font.GothamBold,
     fMono = Enum.Font.Code,
-    fCaption = 11,
+    fCaption = 12,
     fBody    = 13,
     fTitle   = 15,
     fCode    = 12,
@@ -228,6 +229,7 @@ function Lib.new(opts)
     self._flagSigs = {}
     self._conns    = {}
     self._windows  = {}
+    self._elements = {}
     if makefolder and isfolder and not isfolder(self.Folder) then
         pcall(makefolder, self.Folder)
     end
@@ -250,8 +252,10 @@ function Lib:SetFlag(name, value)
     self._flags[name] = value
     local sigs = self._flagSigs[name]
     if sigs and prev ~= value then
-        for _, fn in ipairs(sigs) do
-            task.spawn(function() pcall(fn, value) end)
+        -- Dispatch in order: asynchronous notifications can apply stale values.
+        for _, fn in ipairs(table.clone(sigs)) do
+            local ok, err = pcall(fn, value)
+            if not ok then warn("[Neutral UI flag]", name, err) end
         end
     end
 end
@@ -262,6 +266,24 @@ function Lib:OnFlagChanged(name, fn)
     self._flagSigs[name] = self._flagSigs[name] or {}
     table.insert(self._flagSigs[name], fn)
     return fn
+end
+
+-- OnFlagChanged still returns the original callback for API compatibility.
+function Lib:OffFlagChanged(name, fn)
+    local listeners = self._flagSigs and self._flagSigs[name]
+    if not listeners then return end
+    local at = table.find(listeners, fn)
+    if at then table.remove(listeners, at) end
+    if #listeners == 0 then self._flagSigs[name] = nil end
+end
+
+-- Component-owned subscriptions are disposed with their element.
+local function observeFlag(lib, flag, bag, fn)
+    if not flag then return end
+    lib:OnFlagChanged(flag, fn)
+    table.insert(bag, {
+        Disconnect = function() lib:OffFlagChanged(flag, fn) end,
+    })
 end
 
 function Lib:_GetInitial(flag, default)
@@ -435,9 +457,10 @@ function Lib:Dialog(opts)
 
     local dlg = inst("Frame", {
         AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
-        Size = UDim2.fromOffset(360, 0), AutomaticSize = Enum.AutomaticSize.Y,
+        Size = UDim2.new(1, -32, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
         BackgroundColor3 = T.surface, BorderSizePixel = 0, Active = true, ZIndex = 201,
     }, overlay)
+    inst("UISizeConstraint", {MaxSize = Vector2.new(360, 10000)}, dlg)
     corner(dlg, T.rMd)
     stroke(dlg, T.border)
     pad(dlg, T.xl, T.xl)
@@ -487,6 +510,10 @@ function Lib:Dialog(opts)
     focusRing(confirm, {})
 
     local escConn
+    -- Closing the owning ScreenGui also disconnects the global Escape handler.
+    overlay.Destroying:Connect(function()
+        if escConn then escConn:Disconnect(); escConn = nil end
+    end)
     local function dismiss(cb)
         if escConn then escConn:Disconnect() end
         if overlay.Parent then overlay:Destroy() end
@@ -582,17 +609,14 @@ function Lib:Window(opts)
     local function layout()
         local vx, vy = cam.ViewportSize.X, cam.ViewportSize.Y
         compact = vx < T.compactBelow
-        if collapsed then
-            root.Size = UDim2.new(root.Size.X.Scale, root.Size.X.Offset, 0, T.headerH)
-        elseif compact then
-            root.Size = UDim2.fromOffset(math.min(W, vx - 24), math.min(H, vy - 24))
-        else
-            root.Size = UDim2.fromOffset(W, H)
-        end
+        -- Clamp on every viewport, not only compact screens.
+        local width = math.min(W, math.max(180, vx - 24))
+        local height = math.min(H, math.max(T.headerH + 96, vy - 24))
+        root.Size = UDim2.fromOffset(width, collapsed and T.headerH or height)
 
         local top = T.headerH
         local f = statusBar and T.statusH or 0
-        local navH = 48
+        local navH = 56
 
         if compact then
             side.Position = UDim2.fromOffset(0, top)
@@ -621,7 +645,7 @@ function Lib:Window(opts)
         end
 
         for _, e in ipairs(win._tabs) do
-            e.btn.Size = compact and UDim2.fromOffset(124, 32) or UDim2.new(1, 0, 0, 32)
+            e.btn.Size = compact and UDim2.fromOffset(124, 40) or UDim2.new(1, 0, 0, 36)
             if compact then
                 e.indicator.Size = UDim2.new(1, -16, 0, 2)
                 e.indicator.Position = UDim2.new(0, 8, 1, -2)
@@ -634,44 +658,69 @@ function Lib:Window(opts)
         local show = not collapsed
         side.Visible = show
         content.Visible = show
-        divider.Visible = show and divider.Visible
+        divider.Visible = show and not compact
         if statusBar then statusBar.Visible = show end
     end
 
-    -- drag by header
-    local dragging, dragStart, startPos = false, nil, nil
+    -- Drag by the header; keep the header reachable and track the active touch.
+    local dragInput, dragStart, startPos
     conn(win._conns, header.InputBegan, function(i)
-        if isPress(i) then
-            dragging = true
-            dragStart = i.Position
-            startPos = root.Position
-        end
+        if not isPress(i) or dragInput then return end
+        -- Do not interpret minimize / close button presses as drags.
+        if i.Position.X >= header.AbsolutePosition.X + header.AbsoluteSize.X - 76 then return end
+        dragInput, dragStart, startPos = i, i.Position, root.Position
     end)
     conn(win._conns, UIS.InputEnded, function(i)
-        if isPress(i) then dragging = false end
+        if dragInput and (i == dragInput or (dragInput.UserInputType == Enum.UserInputType.MouseButton1
+            and i.UserInputType == Enum.UserInputType.MouseButton1)) then
+            dragInput = nil
+        end
     end)
     conn(win._conns, UIS.InputChanged, function(i)
-        if dragging and isMove(i) then
-            local d = i.Position - dragStart
-            root.Position = UDim2.new(
-                startPos.X.Scale, startPos.X.Offset + d.X,
-                startPos.Y.Scale, startPos.Y.Offset + d.Y)
-        end
+        if not dragInput then return end
+        local touch = dragInput.UserInputType == Enum.UserInputType.Touch
+        if (touch and i ~= dragInput) or (not touch and i.UserInputType ~= Enum.UserInputType.MouseMovement) then return end
+        local d = i.Position - dragStart
+        local viewport = cam.ViewportSize
+        local centerX = viewport.X * startPos.X.Scale + startPos.X.Offset + d.X
+        local centerY = viewport.Y * startPos.Y.Scale + startPos.Y.Offset + d.Y
+        local width = root.AbsoluteSize.X
+        -- A visible header can always be grabbed again.
+        centerX = math.clamp(centerX, 60 - width / 2, viewport.X - 60 + width / 2)
+        centerY = math.clamp(centerY, T.headerH / 2, viewport.Y - T.headerH / 2)
+        root.Position = UDim2.fromOffset(centerX, centerY)
     end)
     conn(win._conns, cam:GetPropertyChangedSignal("ViewportSize"), layout)
     layout()
 
     btnMin.MouseButton1Click:Connect(function()
         collapsed = not collapsed
+        btnMin.Text = collapsed and "+" or "–"
         layout()
     end)
 
     function win:Close()
+        if not self._gui then return end
+        -- Dispose component-level UserInputService and flag listeners first.
+        local owned = {}
+        for frame, element in pairs(lib._elements) do
+            if frame:IsDescendantOf(self._gui) then
+                table.insert(owned, element)
+            end
+        end
+        for _, element in ipairs(owned) do element:Destroy() end
         for _, c in ipairs(self._conns) do pcall(function() c:Disconnect() end) end
         table.clear(self._conns)
-        if self._gui then
-            if lib._gui == self._gui then lib._gui = nil end
-            self._gui:Destroy()
+        local oldGui = self._gui
+        self._gui = nil
+        oldGui:Destroy()
+        local index = table.find(lib._windows, self)
+        if index then table.remove(lib._windows, index) end
+        if lib._gui == oldGui then
+            lib._gui = nil
+            for _, other in ipairs(lib._windows) do
+                if other._gui then lib._gui = other._gui; break end
+            end
         end
     end
     btnClose.MouseButton1Click:Connect(function() win:Close() end)
@@ -765,7 +814,7 @@ function Lib:Window(opts)
 end
 
 function Lib:CloseAll()
-    for _, w in ipairs(self._windows or {}) do
+    for _, w in ipairs(table.clone(self._windows or {})) do
         if w.Close then pcall(function() w:Close() end) end
     end
     self._windows = {}
@@ -973,25 +1022,43 @@ function Lib:_Element(frame, opts, internal)
         frame.Visible = self._visible
     end
     function el:SetLocked(v)
-        self._locked = v ~= false
-        local locked = self._locked
+        local locked = v ~= false
+        if self._locked == locked then return end
+        self._locked = locked
+        self._originalStates = self._originalStates or {}
         local nodes = {frame}
         for _, d in ipairs(frame:GetDescendants()) do table.insert(nodes, d) end
         for _, d in ipairs(nodes) do
-            if d:IsA("GuiButton") or d:IsA("TextBox") then d.Active = not locked end
+            local original = self._originalStates[d]
+            if locked then
+                original = {
+                    Active = d.Active,
+                    TextTransparency = (d:IsA("TextLabel") or d:IsA("TextButton")) and d.TextTransparency or nil,
+                }
+                self._originalStates[d] = original
+            end
+            if d:IsA("GuiButton") or d:IsA("TextBox") then
+                if locked then d.Active = false
+                elseif original then d.Active = original.Active end
+            end
             if d:IsA("TextLabel") or d:IsA("TextButton") then
-                d.TextTransparency = locked and 0.5 or 0
+                d.TextTransparency = locked and 0.5 or (original and original.TextTransparency or 0)
             end
         end
+        if not locked then self._originalStates = {} end
     end
     function el:Destroy()
+        if self._destroyed then return end
+        self._destroyed = true
         for _, c in ipairs(self._conns) do pcall(function() c:Disconnect() end) end
-        self._conns = {}
+        table.clear(self._conns)
+        self._lib._elements[frame] = nil
         if frame.Parent then frame:Destroy() end
     end
     function el:Refresh()
         if self._refresh then self._refresh() end
     end
+    self._elements[frame] = el
     return el
 end
 
@@ -1223,7 +1290,7 @@ function Lib:_Toggle(parent, o)
 
     hb.MouseButton1Click:Connect(function() setState(not state) end)
     if flag then
-        lib:OnFlagChanged(flag, function(v) if v ~= state then setState(v, true) end end)
+        observeFlag(lib, flag, bag, function(v) if v ~= state then setState(v, true) end end)
     end
     paint()
 
@@ -1292,7 +1359,7 @@ function Lib:_Checkbox(parent, o)
 
     hb.MouseButton1Click:Connect(function() setState(not state) end)
     if flag then
-        lib:OnFlagChanged(flag, function(v) if v ~= state then setState(v, true) end end)
+        observeFlag(lib, flag, bag, function(v) if v ~= state then setState(v, true) end end)
     end
     paint()
 
@@ -1380,7 +1447,7 @@ function Lib:_RadioGroup(parent, o)
     end
 
     if flag then
-        lib:OnFlagChanged(flag, function(v) if v ~= current then setValue(v, true) end end)
+        observeFlag(lib, flag, bag, function(v) if v ~= current then setValue(v, true) end end)
     end
     paint()
 
@@ -1441,7 +1508,7 @@ function Lib:_Slider(parent, o)
     focusRing(hit, bag)
 
     local function paint()
-        local f = (val - mn) / (mx - mn)
+        local f = (mx > mn) and (val - mn) / (mx - mn) or 0
         fill.Size = UDim2.new(f, 0, 1, 0)
         knob.Position = UDim2.new(f, 0, 0.5, 0)
         valLbl.Text = tostring(val) .. suffix
@@ -1458,6 +1525,7 @@ function Lib:_Slider(parent, o)
 
     local dragging, focused = false, false
     local function fromInput(i)
+        if track.AbsoluteSize.X <= 0 then return end
         local r = math.clamp((i.Position.X - track.AbsolutePosition.X) / track.AbsoluteSize.X, 0, 1)
         setVal(mn + r * (mx - mn))
     end
@@ -1483,7 +1551,7 @@ function Lib:_Slider(parent, o)
     end)
 
     if flag then
-        lib:OnFlagChanged(flag, function(v)
+        observeFlag(lib, flag, bag, function(v)
             if type(v) == "number" and v ~= val then setVal(v, true) end
         end)
     end
@@ -1553,8 +1621,9 @@ function Lib:_RangeSlider(parent, o)
     end
 
     local function paint()
-        local a = (lo - mn) / (mx - mn)
-        local b = (hi - mn) / (mx - mn)
+        local span = math.max(mx - mn, 1e-6)
+        local a = (lo - mn) / span
+        local b = (hi - mn) / span
         fill.Position = UDim2.new(a, 0, 0, 0)
         fill.Size = UDim2.new(b - a, 0, 1, 0)
         kLo.Position = UDim2.new(a, 0, 0.5, 0)
@@ -1562,15 +1631,26 @@ function Lib:_RangeSlider(parent, o)
         valLbl.Text = tostring(lo) .. " – " .. tostring(hi)
     end
 
+    local function commitRange(l, h, fromFlag)
+        if type(l) ~= "number" or type(h) ~= "number" then return end
+        l, h = snap(l), snap(h)
+        if l > h then l, h = h, l end
+        if l == lo and h == hi then return end
+        lo, hi = l, h
+        paint()
+        if not fromFlag then
+            if flag then lib:SetFlag(flag, {lo, hi}) end
+            if o.Callback then pcall(o.Callback, lo, hi) end
+        end
+    end
+
     local active
     local function fromInput(i)
+        if track.AbsoluteSize.X <= 0 then return end
         local r = math.clamp((i.Position.X - track.AbsolutePosition.X) / track.AbsoluteSize.X, 0, 1)
         local v = snap(mn + r * (mx - mn))
-        if active == "lo" then lo = math.min(v, hi)
-        elseif active == "hi" then hi = math.max(v, lo) end
-        paint()
-        if flag then lib:SetFlag(flag, {lo, hi}) end
-        if o.Callback then pcall(o.Callback, lo, hi) end
+        if active == "lo" then commitRange(math.min(v, hi), hi)
+        elseif active == "hi" then commitRange(lo, math.max(v, lo)) end
     end
 
     -- each knob gets its own hit target so both are keyboard-selectable
@@ -1597,23 +1677,18 @@ function Lib:_RangeSlider(parent, o)
     end)
 
     if flag then
-        lib:OnFlagChanged(flag, function(v)
-            if type(v) == "table" and v[1] and v[2] then
-                lo, hi = v[1], v[2]
-                paint()
-            end
+        observeFlag(lib, flag, bag, function(v)
+            if type(v) == "table" then commitRange(v[1], v[2], true) end
         end)
     end
+    lo, hi = snap(lo), snap(hi)
+    if lo > hi then lo, hi = hi, lo end
     paint()
 
     return self:_Element(box, o, {
         conns = bag,
         get = function() return lo, hi end,
-        set = function(l, h)
-            lo = snap(l or lo)
-            if h then hi = snap(h) end
-            paint()
-        end,
+        set = function(l, h) commitRange(l or lo, h or hi) end,
         refresh = paint,
     })
 end
@@ -1668,7 +1743,7 @@ function Lib:_Stepper(parent, o)
     minus.MouseButton1Click:Connect(function() setVal(val - step) end)
     plus.MouseButton1Click:Connect(function() setVal(val + step) end)
     if flag then
-        lib:OnFlagChanged(flag, function(v) if v ~= val then setVal(v, true) end end)
+        observeFlag(lib, flag, bag, function(v) if v ~= val then setVal(v, true) end end)
     end
     paint()
 
@@ -1693,8 +1768,10 @@ function Lib:_Dropdown(parent, o)
     local opts = {}
     for i, v in ipairs(o.Options or {}) do opts[i] = v end
 
-    local current = lib:_GetInitial(flag, multi and {} or (o.Default or opts[1] or ""))
-    if multi and type(current) ~= "table" then current = {} end
+    local current = lib:_GetInitial(flag, multi and (o.Default or {}) or (o.Default or opts[1] or ""))
+    if multi then
+        current = type(current) == "table" and table.clone(current) or {}
+    end
 
     local function isEmpty()
         if multi then return next(current) == nil end
@@ -1778,6 +1855,30 @@ function Lib:_Dropdown(parent, o)
     vlist(scroller, 2)
 
     local rowsBuilt = {}
+    local setOpen -- per-dropdown; never pollute the shared/global environment
+    local rebuild -- declared before setValue so active lists can refresh
+
+    local function sameSelection(a, b)
+        for k, v in pairs(a) do if b[k] ~= v then return false end end
+        for k, v in pairs(b) do if a[k] ~= v then return false end end
+        return true
+    end
+
+    local function setValue(v, fromFlag)
+        if multi then
+            if type(v) ~= "table" or sameSelection(current, v) then return end
+            current = table.clone(v)
+        else
+            if v == current then return end
+            current = v
+        end
+        paint()
+        if open then rebuild(searchBox and searchBox.Text or "") end
+        if not fromFlag then
+            if flag then lib:SetFlag(flag, multi and table.clone(current) or current) end
+            if o.Callback then pcall(o.Callback, multi and table.clone(current) or current) end
+        end
+    end
 
     local function resize()
         local rows = math.max(#rowsBuilt, 1)
@@ -1788,7 +1889,7 @@ function Lib:_Dropdown(parent, o)
         box.Size = UDim2.new(1, 0, 0, T.rowH + 4 + listH)
     end
 
-    local function rebuild(filter)
+    rebuild = function(filter)
         for _, r in ipairs(rowsBuilt) do r:Destroy() end
         rowsBuilt = {}
         filter = (filter or ""):lower()
@@ -1822,18 +1923,13 @@ function Lib:_Dropdown(parent, o)
                 end
                 ob.MouseButton1Click:Connect(function()
                     if multi then
-                        current[opt] = (not current[opt]) and true or nil
-                        paint()
-                        if flag then lib:SetFlag(flag, current) end
-                        if o.Callback then pcall(o.Callback, current) end
-                        rebuild(searchBox and searchBox.Text or "")
+                        local nextSelection = table.clone(current)
+                        nextSelection[opt] = not nextSelection[opt] or nil
+                        setValue(nextSelection)
                         resize()
                     else
-                        current = opt
-                        paint()
+                        setValue(opt)
                         setOpen(false)
-                        if flag then lib:SetFlag(flag, current) end
-                        if o.Callback then pcall(o.Callback, current) end
                     end
                 end)
                 table.insert(rowsBuilt, ob)
@@ -1851,7 +1947,7 @@ function Lib:_Dropdown(parent, o)
         end
     end
 
-    function setOpen(v)
+    setOpen = function(v)
         open = v and true or false
         list.Visible = open
         chev.Text = open and "▴" or "▾"
@@ -1864,36 +1960,29 @@ function Lib:_Dropdown(parent, o)
     end
 
     head.MouseButton1Click:Connect(function() setOpen(not open) end)
+    -- Dismiss when pointer interaction happens outside the expanded dropdown.
+    conn(bag, UIS.InputBegan, function(i)
+        if not open or not isPress(i) then return end
+        local p, a, sz = i.Position, box.AbsolutePosition, box.AbsoluteSize
+        if p.X < a.X or p.X > a.X + sz.X or p.Y < a.Y or p.Y > a.Y + sz.Y then
+            setOpen(false)
+        end
+    end)
     if searchBox then
         searchBox:GetPropertyChangedSignal("Text"):Connect(function()
-            rebuild(searchBox.Text)
-            resize()
+            if open then rebuild(searchBox.Text); resize() end
         end)
     end
 
     if flag then
-        lib:OnFlagChanged(flag, function(v)
-            if multi then
-                if type(v) == "table" then current = v end
-            else
-                current = v
-            end
-            paint()
-        end)
+        observeFlag(lib, flag, bag, function(v) setValue(v, true) end)
     end
     paint()
 
     return self:_Element(box, o, {
         conns = bag,
-        get = function() return current end,
-        set = function(v)
-            if multi then
-                if type(v) == "table" then current = v end
-            else
-                current = v
-            end
-            paint()
-        end,
+        get = function() return multi and table.clone(current) or current end,
+        set = function(v) setValue(v) end,
         refresh = function()
             paint()
             if open then rebuild(searchBox and searchBox.Text or ""); resize() end
@@ -1907,6 +1996,7 @@ function Lib:_Textbox(parent, o)
     local T = self.Theme
     local lib = self
     local flag = o.Flag or o.Id
+    local bag = {}
     local init = lib:_GetInitial(flag, o.Default or "")
     if type(init) ~= "string" then init = tostring(init) end
 
@@ -1945,14 +2035,21 @@ function Lib:_Textbox(parent, o)
     end)
 
     if flag then
-        lib:OnFlagChanged(flag, function(v)
+        observeFlag(lib, flag, bag, function(v)
             if type(v) == "string" and v ~= tb.Text then tb.Text = v end
         end)
     end
 
     local el = self:_Element(wrap, o, {
+        conns = bag,
         get = function() return tb.Text end,
-        set = function(v) tb.Text = tostring(v) end,
+        set = function(v)
+            v = tostring(v)
+            if v == tb.Text then return end
+            tb.Text = v
+            if flag then lib:SetFlag(flag, v) end
+            if o.Callback then pcall(o.Callback, v) end
+        end,
     })
     function el:SetStatus(kind, msg) setStatus(kind, msg) end
     return el
@@ -1963,6 +2060,7 @@ function Lib:_NumberInput(parent, o)
     local T = self.Theme
     local lib = self
     local flag = o.Flag or o.Id
+    local bag = {}
     local init = lib:_GetInitial(flag, o.Default or 0)
     if type(init) ~= "number" then init = tonumber(init) or 0 end
     local lastValid = init
@@ -2011,7 +2109,7 @@ function Lib:_NumberInput(parent, o)
     end)
 
     if flag then
-        lib:OnFlagChanged(flag, function(v)
+        observeFlag(lib, flag, bag, function(v)
             if type(v) == "number" and v ~= lastValid then
                 lastValid = v
                 tb.Text = tostring(v)
@@ -2021,12 +2119,18 @@ function Lib:_NumberInput(parent, o)
     paint()
 
     local el = self:_Element(wrap, o, {
+        conns = bag,
         get = function() return tonumber(tb.Text) or lastValid end,
         set = function(v)
-            if type(v) == "number" then
-                tb.Text = tostring(v)
-                lastValid = v
-            end
+            if type(v) ~= "number" then return end
+            if o.Min ~= nil then v = math.max(o.Min, v) end
+            if o.Max ~= nil then v = math.min(o.Max, v) end
+            if v == lastValid then return end
+            tb.Text = tostring(v)
+            lastValid = v
+            setStatus(nil)
+            if flag then lib:SetFlag(flag, v) end
+            if o.Callback then pcall(o.Callback, v) end
         end,
     })
     function el:SetStatus(kind, msg) setStatus(kind, msg) end
@@ -2150,7 +2254,7 @@ function Lib:_Keybind(parent, o)
     end
 
     if flag then
-        lib:OnFlagChanged(flag, function(v)
+        observeFlag(lib, flag, bag, function(v)
             local k = keyFromName(v)
             if k then key = k; paintChip() end
         end)
@@ -2161,9 +2265,13 @@ function Lib:_Keybind(parent, o)
         conns = bag,
         get = function() return key end,
         set = function(v)
-            if typeof(v) == "EnumItem" then key = v
-            elseif type(v) == "string" then key = keyFromName(v) or key end
+            local nextKey = typeof(v) == "EnumItem" and v
+                or (type(v) == "string" and keyFromName(v) or nil)
+            if not nextKey or nextKey == key then return end
+            key = nextKey
             paintChip()
+            if flag then lib:SetFlag(flag, key.Name) end
+            if o.Callback then pcall(o.Callback, key, false) end
         end,
         refresh = paintChip,
     })
@@ -2287,7 +2395,7 @@ function Lib:_ColorPicker(parent, o)
 
     paint(true)
     if flag then
-        lib:OnFlagChanged(flag, function(c)
+        observeFlag(lib, flag, bag, function(c)
             if typeof(c) == "Color3" and c ~= cur then
                 hue, sat, val = Color3.toHSV(c)
                 paint(true)
@@ -2379,3 +2487,4 @@ function Lib:_CodeViewer(parent, o)
 end
 
 return Lib
+

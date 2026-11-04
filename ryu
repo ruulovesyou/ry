@@ -1,13 +1,11 @@
 --[[
-    Neutral UI Library — structural spec implementation
-    - Rayfield-style sidebar rail + content card
-    - WindUI-style per-element surface + title/desc
-    - Fluent-style tween motion
-    - Cascade-style hairlines + sparse accent
-    - Venyx-style active indicators
-    - LinoriaLib-style label-left / control-right grid
-    - Obsidian-style config manager + flag system
-    All theme tokens are overridable via Lib.Theme
+    Neutral UI Library — final build
+    Rayfield · WindUI · Fluent · Cascade · Venyx · LinoriaLib · Obsidian DNA
+    Theme tokens overridable via Lib.Theme
+    Canonical usage:
+        local Lib = loadstring(...)()
+        local ui  = Lib.new({ Name = "Oxrus", Folder = "Oxrus" })
+        local win = ui:Window({ Title = "Oxrus" })
 ]]
 
 local TS  = game:GetService("TweenService")
@@ -16,6 +14,13 @@ local HS  = game:GetService("HttpService")
 
 local Lib = {}
 Lib.__index = Lib
+
+Lib.Name      = "UI"
+Lib.Folder    = "UILib"
+Lib._flags    = {}
+Lib._flagSigs = {}
+Lib._conns    = {}
+Lib._windows  = {}
 
 Lib.Theme = {
     bg          = Color3.fromRGB(18,18,22),
@@ -68,15 +73,41 @@ local function conn(bag, sig, fn)
     return c
 end
 
+-- serialization helpers for non-JSON types ------------------------------
+local function encode(v)
+    if typeof(v) == "Color3" then
+        return {__t = "Color3", r = v.R, g = v.G, b = v.B}
+    end
+    if type(v) == "table" then
+        local out = {}
+        for k, vv in pairs(v) do out[k] = encode(vv) end
+        return out
+    end
+    return v
+end
+
+local function decode(v)
+    if type(v) == "table" then
+        if v.__t == "Color3" then
+            return Color3.new(v.r or 1, v.g or 1, v.b or 1)
+        end
+        local out = {}
+        for k, vv in pairs(v) do out[k] = decode(vv) end
+        return out
+    end
+    return v
+end
+
+-- root ------------------------------------------------------------------
 function Lib.new(opts)
     opts = opts or {}
     local self = setmetatable({}, Lib)
-    self.Name     = opts.Name or "UI"
-    self.Folder   = opts.Folder or "UILib"
-    self._flags   = {}
-    self._flagSigs= {}
-    self._conns   = {}
-    self._windows = {}
+    self.Name      = opts.Name or "UI"
+    self.Folder    = opts.Folder or "UILib"
+    self._flags    = {}
+    self._flagSigs = {}
+    self._conns    = {}
+    self._windows  = {}
 
     if makefolder and isfolder and not isfolder(self.Folder) then
         pcall(makefolder, self.Folder)
@@ -87,42 +118,64 @@ function Lib.new(opts)
     return self
 end
 
-function Lib:GetFlag(name) return self._flags[name] end
+-- flags -----------------------------------------------------------------
+function Lib:GetFlag(name)
+    return (self._flags or {})[name]
+end
 
 function Lib:SetFlag(name, value)
     if not name then return end
+    self._flags    = self._flags or {}
+    self._flagSigs = self._flagSigs or {}
     local prev = self._flags[name]
     self._flags[name] = value
     local sigs = self._flagSigs[name]
-    if sigs then
-        for _,fn in ipairs(sigs) do
-            if prev ~= value then
-                task.spawn(function() pcall(fn, value) end)
-            end
+    if sigs and prev ~= value then
+        for _, fn in ipairs(sigs) do
+            task.spawn(function() pcall(fn, value) end)
         end
     end
 end
 
 function Lib:OnFlagChanged(name, fn)
     if not name then return end
+    self._flagSigs = self._flagSigs or {}
     if not self._flagSigs[name] then self._flagSigs[name] = {} end
     table.insert(self._flagSigs[name], fn)
     return fn
 end
 
+function Lib:_GetInitial(flag, default)
+    if not flag then return default end
+    local existing = self:GetFlag(flag)
+    if existing ~= nil then return existing end
+    self:SetFlag(flag, default)
+    return default
+end
+
+-- config ----------------------------------------------------------------
 function Lib:SaveConfig(name)
     name = name or "default"
     if not writefile then return end
+    if makefolder and isfolder and not isfolder(self.Folder) then
+        pcall(makefolder, self.Folder)
+    end
     local data = {}
-    for k,v in pairs(self._flags) do
-        if type(v) ~= "function" and type(v) ~= "Instance" then
-            data[k] = v
+    for k, v in pairs(self._flags or {}) do
+        local ty = typeof(v)
+        if ty ~= "function" and ty ~= "RBXScriptSignal"
+        and ty ~= "Instance" and ty ~= "EnumItem" then
+            data[k] = encode(v)
         end
     end
-    pcall(function()
+    local ok = pcall(function()
         writefile(self.Folder .. "/" .. name .. ".json", HS:JSONEncode(data))
     end)
-    self:Notify({Title = "Config saved", Body = name, Type = "success"})
+    if ok then
+        self:Notify({Title = "Config saved", Body = name, Type = "success"})
+    else
+        self:Notify({Title = "Config save failed", Body = name, Type = "error"})
+    end
 end
 
 function Lib:LoadConfig(name)
@@ -131,9 +184,12 @@ function Lib:LoadConfig(name)
     local ok, data = pcall(function()
         return HS:JSONDecode(readfile(self.Folder .. "/" .. name .. ".json"))
     end)
-    if not ok or type(data) ~= "table" then return end
-    for k,v in pairs(data) do
-        self:SetFlag(k, v)
+    if not ok or type(data) ~= "table" then
+        self:Notify({Title = "Config load failed", Body = name, Type = "error"})
+        return
+    end
+    for k, v in pairs(data) do
+        self:SetFlag(k, decode(v))
     end
     self:Notify({Title = "Config loaded", Body = name, Type = "info"})
 end
@@ -150,7 +206,7 @@ function Lib:ListConfigs()
     local out = {}
     local ok, files = pcall(function() return listfiles(self.Folder) end)
     if ok then
-        for _,f in ipairs(files) do
+        for _, f in ipairs(files) do
             local n = f:match("([^/\\]+)%.json$")
             if n then table.insert(out, n) end
         end
@@ -158,16 +214,17 @@ function Lib:ListConfigs()
     return out
 end
 
+-- notifications ---------------------------------------------------------
 function Lib:_EnsureNotifStack()
     if self._notifStack and self._notifStack.Parent then return end
-    local guiPar = (gethui and gethui()) or game:GetService("CoreGui")
+    local guiPar = self._gui or (gethui and gethui()) or game:GetService("CoreGui")
     local container = inst("Frame", {
         Name = "_NotifStack",
         Size = UDim2.fromOffset(300, 500),
         Position = UDim2.new(1, -320, 1, -520),
         BackgroundTransparency = 1,
         ZIndex = 100,
-    }, self._gui or guiPar)
+    }, guiPar)
     inst("UIListLayout", {
         Padding = UDim.new(0, 6),
         SortOrder = Enum.SortOrder.LayoutOrder,
@@ -247,6 +304,7 @@ function Lib:Notify(opts)
     return card
 end
 
+-- dialog ----------------------------------------------------------------
 function Lib:Dialog(opts)
     opts = opts or {}
     local t = self.Theme
@@ -320,7 +378,10 @@ function Lib:Dialog(opts)
     }, dlg)
     inst("UICorner", {CornerRadius = t.rSm}, confirm)
 
+    local closed = false
     local function close()
+        if closed then return end
+        closed = true
         if overlay.Parent then overlay:Destroy() end
     end
     confirm.MouseButton1Click:Connect(function()
@@ -338,7 +399,13 @@ function Lib:Dialog(opts)
     return dlg
 end
 
+-- window ----------------------------------------------------------------
 function Lib:Window(opts)
+    self._flags    = self._flags or {}
+    self._flagSigs = self._flagSigs or {}
+    self._conns    = self._conns or {}
+    self._windows  = self._windows or {}
+
     opts = opts or {}
     local t = self.Theme
     local win = {_lib = self, _tabs = {}, _conns = {}}
@@ -364,6 +431,7 @@ function Lib:Window(opts)
     inst("UICorner", {CornerRadius = t.rMd}, root)
     inst("UIStroke", {Color = t.border, Thickness = 1}, root)
     win._root = root
+    table.insert(self._windows, win)
 
     local sc = inst("UIScale", {Scale = 1}, root)
     local cam = workspace.CurrentCamera
@@ -519,9 +587,12 @@ function Lib:Window(opts)
     end)
 
     function win:Close()
-        for _,c in ipairs(self._conns) do c:Disconnect() end
+        for _, c in ipairs(self._conns) do pcall(function() c:Disconnect() end) end
         self._conns = {}
-        if self._gui then self._gui:Destroy() end
+        if self._gui then
+            if self._lib._gui == self._gui then self._lib._gui = nil end
+            self._gui:Destroy()
+        end
     end
     function win:SetVisible(v) self._root.Visible = v ~= false end
     btnClose.MouseButton1Click:Connect(function() win:Close() end)
@@ -592,7 +663,7 @@ function Lib:Window(opts)
         end
         self._tabs[name] = setAct
         btn.MouseButton1Click:Connect(function()
-            for _,f in pairs(self._tabs) do f(false) end
+            for _, f in pairs(self._tabs) do f(false) end
             self._activeTab = name
             setAct(true)
         end)
@@ -610,6 +681,14 @@ function Lib:Window(opts)
     return win
 end
 
+function Lib:CloseAll()
+    for _, w in ipairs(self._windows or {}) do
+        if w.Close then pcall(function() w:Close() end) end
+    end
+    self._windows = {}
+end
+
+-- tab API ---------------------------------------------------------------
 function Lib:_MakeTabAPI(page)
     local tab = {Frame = page, Lib = self}
 
@@ -688,6 +767,7 @@ function Lib:_MakeSectionAPI(container)
     return sec
 end
 
+-- layout primitives -----------------------------------------------------
 function Lib:_GroupBox(parent, title)
     local t = self.Theme
     local box = inst("Frame", {
@@ -790,6 +870,7 @@ end
 
 function Lib:_SubTabs(parent, names)
     local t = self.Theme
+    local lib = self
     local wrap = inst("Frame", {
         Size = UDim2.new(1, 0, 0, 0),
         BackgroundTransparency = 1,
@@ -860,24 +941,32 @@ function Lib:_SubTabs(parent, names)
         Bar = bar,
         Switch = setActive,
         GetActive = function() return active end,
+        Page = function(_, name)
+            local p = pages[name]
+            if not p then return nil end
+            return lib:_MakeSectionAPI(p)
+        end,
     }
 end
 
+-- element base ----------------------------------------------------------
 function Lib:_Element(frame, opts, internal)
+    internal = internal or {}
     local el = {
-        Frame = frame,
-        Flag = opts.Flag or opts.Id,
-        _lib = self,
-        _opts = opts,
-        _locked = false,
+        Frame    = frame,
+        Flag     = opts.Flag or opts.Id,
+        _lib     = self,
+        _opts    = opts,
+        _locked  = false,
         _visible = true,
-        _get = internal.get,
-        _set = internal.set,
+        _conns   = internal.conns or {},
+        _get     = internal.get,
+        _set     = internal.set,
         _refresh = internal.refresh,
     }
-    function el:Set(v)
+    function el:Set(...)
         if self._locked then return end
-        if self._set then self._set(v) end
+        if self._set then self._set(...) end
     end
     function el:Get() if self._get then return self._get() end end
     function el:SetVisible(v)
@@ -886,13 +975,26 @@ function Lib:_Element(frame, opts, internal)
     end
     function el:SetLocked(v)
         self._locked = v ~= false
-        frame.Active = not self._locked
+        local locked = self._locked
+        for _, d in ipairs(frame:GetDescendants()) do
+            if d:IsA("GuiButton") then
+                d.Active = not locked
+                d.Selectable = not locked
+            elseif d:IsA("TextBox") then
+                d.Active = not locked
+            end
+        end
     end
-    function el:Destroy() if frame.Parent then frame:Destroy() end end
+    function el:Destroy()
+        for _, c in ipairs(self._conns) do pcall(function() c:Disconnect() end) end
+        self._conns = {}
+        if frame.Parent then frame:Destroy() end
+    end
     function el:Refresh() if self._refresh then self._refresh() end end
     return el
 end
 
+-- simple text ----------------------------------------------------------
 function Lib:_Label(parent, o)
     o = o or {}
     local t = self.Theme
@@ -977,6 +1079,7 @@ function Lib:_Image(parent, o)
     })
 end
 
+-- buttons --------------------------------------------------------------
 function Lib:_Button(parent, o)
     o = o or {}
     local t = self.Theme
@@ -1014,7 +1117,7 @@ function Lib:_ConfirmButton(parent, o)
     o = o or {}
     local lib = self
     local wrapped = {}
-    for k,v in pairs(o) do wrapped[k] = v end
+    for k, v in pairs(o) do wrapped[k] = v end
     local originalCb = o.Callback
     wrapped.Callback = function()
         lib:Dialog({
@@ -1067,13 +1170,13 @@ function Lib:_ButtonRow(parent, o)
     return self:_Element(row, o, {})
 end
 
+-- toggle ----------------------------------------------------------------
 function Lib:_Toggle(parent, o)
     o = o or {}
     local t = self.Theme
     local lib = self
     local flag = o.Flag or o.Id
-    local state = o.Default and true or false
-    if flag then lib:SetFlag(flag, state) end
+    local state = lib:_GetInitial(flag, o.Default and true or false) and true or false
 
     local row = inst("Frame", {
         Size = UDim2.new(1, 0, 0, 36),
@@ -1155,13 +1258,13 @@ function Lib:_Toggle(parent, o)
     })
 end
 
+-- checkbox -------------------------------------------------------------
 function Lib:_Checkbox(parent, o)
     o = o or {}
     local t = self.Theme
     local lib = self
     local flag = o.Flag or o.Id
-    local state = o.Default and true or false
-    if flag then lib:SetFlag(flag, state) end
+    local state = lib:_GetInitial(flag, o.Default and true or false) and true or false
 
     local row = inst("Frame", {
         Size = UDim2.new(1, 0, 0, 30),
@@ -1230,13 +1333,13 @@ function Lib:_Checkbox(parent, o)
     })
 end
 
+-- radio group ----------------------------------------------------------
 function Lib:_RadioGroup(parent, o)
     o = o or {}
     local t = self.Theme
     local lib = self
     local flag = o.Flag or o.Id
-    local current = o.Default or (o.Options and o.Options[1])
-    if flag then lib:SetFlag(flag, current) end
+    local current = lib:_GetInitial(flag, o.Default or (o.Options and o.Options[1]))
 
     local wrap = inst("Frame", {
         Size = UDim2.new(1, 0, 0, 0),
@@ -1314,6 +1417,7 @@ function Lib:_RadioGroup(parent, o)
     })
 end
 
+-- slider ---------------------------------------------------------------
 function Lib:_Slider(parent, o)
     o = o or {}
     local t = self.Theme
@@ -1321,10 +1425,10 @@ function Lib:_Slider(parent, o)
     local flag = o.Flag or o.Id
     local mn, mx = o.Min or 0, o.Max or 100
     local step = o.Step or 1
-    local val = o.Default or mn
+    local val = lib:_GetInitial(flag, o.Default or mn)
     val = math.clamp(val, mn, mx)
-    if flag then lib:SetFlag(flag, val) end
 
+    local conns = {}
     local box = inst("Frame", {
         Size = UDim2.new(1, 0, 0, 50),
         BackgroundColor3 = t.surface,
@@ -1376,6 +1480,11 @@ function Lib:_Slider(parent, o)
     }, trackBg)
     inst("UICorner", {CornerRadius = UDim.new(1, 0)}, knob)
 
+    local function snap(v)
+        if step > 0 then v = math.floor(v / step + 0.5) * step end
+        return math.clamp(v, mn, mx)
+    end
+
     local function paint()
         local tt = (val - mn) / (mx - mn)
         fill.Size = UDim2.new(tt, 0, 1, 0)
@@ -1384,8 +1493,7 @@ function Lib:_Slider(parent, o)
     end
 
     local function setVal(v, fromFlag)
-        v = math.clamp(v, mn, mx)
-        if step >= 1 then v = math.floor(v / step + 0.5) * step end
+        v = snap(v)
         if v == val then return end
         val = v
         paint()
@@ -1399,23 +1507,28 @@ function Lib:_Slider(parent, o)
         setVal(mn + r * (mx - mn))
     end
     trackBg.InputBegan:Connect(function(i)
-        if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+        if i.UserInputType == Enum.UserInputType.MouseButton1
+        or i.UserInputType == Enum.UserInputType.Touch then
             dragging = true; update(i)
         end
     end)
-    UIS.InputChanged:Connect(function(i)
-        if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
+    conn(conns, UIS.InputChanged, function(i)
+        if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement
+        or i.UserInputType == Enum.UserInputType.Touch) then
             update(i)
         end
     end)
-    UIS.InputEnded:Connect(function(i)
-        if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+    conn(conns, UIS.InputEnded, function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1
+        or i.UserInputType == Enum.UserInputType.Touch then
             dragging = false
         end
     end)
 
     if flag then
-        lib:OnFlagChanged(flag, function(v) if v ~= val then setVal(v, true) end end)
+        lib:OnFlagChanged(flag, function(v)
+            if type(v) == "number" and v ~= val then setVal(v, true) end
+        end)
     end
 
     paint()
@@ -1423,19 +1536,30 @@ function Lib:_Slider(parent, o)
         get = function() return val end,
         set = function(v) setVal(v) end,
         refresh = paint,
+        conns = conns,
     })
 end
 
+-- range slider ---------------------------------------------------------
 function Lib:_RangeSlider(parent, o)
     o = o or {}
     local t = self.Theme
     local lib = self
     local flag = o.Flag or o.Id
+    local step = o.Step or 1
     local mn, mx = o.Min or 0, o.Max or 100
-    local lo = o.DefaultMin or mn
-    local hi = o.DefaultMax or mx
-    if flag then lib:SetFlag(flag, {lo, hi}) end
 
+    local saved = flag and lib:GetFlag(flag)
+    local lo, hi
+    if type(saved) == "table" and saved[1] and saved[2] then
+        lo, hi = saved[1], saved[2]
+    else
+        lo = o.DefaultMin or mn
+        hi = o.DefaultMax or mx
+        if flag then lib:SetFlag(flag, {lo, hi}) end
+    end
+
+    local conns = {}
     local box = inst("Frame", {
         Size = UDim2.new(1, 0, 0, 50),
         BackgroundColor3 = t.surface,
@@ -1473,8 +1597,6 @@ function Lib:_RangeSlider(parent, o)
     inst("UICorner", {CornerRadius = UDim.new(1, 0)}, trackBg)
 
     local fill = inst("Frame", {
-        Size = UDim2.new((hi-lo)/(mx-mn), 0, 1, 0),
-        Position = UDim2.new((lo-mn)/(mx-mn), 0, 0, 0),
         BackgroundColor3 = t.accent,
         BorderSizePixel = 0,
     }, trackBg)
@@ -1482,7 +1604,6 @@ function Lib:_RangeSlider(parent, o)
 
     local kLo = inst("Frame", {
         Size = UDim2.fromOffset(14, 14),
-        Position = UDim2.new((lo-mn)/(mx-mn), -7, 0.5, -7),
         BackgroundColor3 = t.text,
         BorderSizePixel = 0,
     }, trackBg)
@@ -1490,73 +1611,93 @@ function Lib:_RangeSlider(parent, o)
 
     local kHi = inst("Frame", {
         Size = UDim2.fromOffset(14, 14),
-        Position = UDim2.new((hi-mn)/(mx-mn), -7, 0.5, -7),
         BackgroundColor3 = t.text,
         BorderSizePixel = 0,
     }, trackBg)
     inst("UICorner", {CornerRadius = UDim.new(1, 0)}, kHi)
 
+    local function snap(v)
+        if step > 0 then v = math.floor(v / step + 0.5) * step end
+        return math.clamp(v, mn, mx)
+    end
+
     local function paint()
         local tl = (lo - mn) / (mx - mn)
         local th = (hi - mn) / (mx - mn)
         fill.Position = UDim2.new(tl, 0, 0, 0)
-        fill.Size = UDim2.new(th - tl, 0, 1, 0)
-        kLo.Position = UDim2.new(tl, -7, 0.5, -7)
-        kHi.Position = UDim2.new(th, -7, 0.5, -7)
-        valLbl.Text = tostring(lo) .. " – " .. tostring(hi)
+        fill.Size     = UDim2.new(th - tl, 0, 1, 0)
+        kLo.Position  = UDim2.new(tl, -7, 0.5, -7)
+        kHi.Position  = UDim2.new(th, -7, 0.5, -7)
+        valLbl.Text   = tostring(lo) .. " – " .. tostring(hi)
     end
 
     local activeHandle = nil
     local function update(i)
         local r = math.clamp((i.Position.X - trackBg.AbsolutePosition.X) / trackBg.AbsoluteSize.X, 0, 1)
-        local v = math.floor(mn + r * (mx - mn))
-        if activeHandle == "lo" then
-            lo = math.min(v, hi)
-        elseif activeHandle == "hi" then
-            hi = math.max(v, lo)
-        end
+        local v = snap(mn + r * (mx - mn))
+        if activeHandle == "lo" then lo = math.min(v, hi)
+        elseif activeHandle == "hi" then hi = math.max(v, lo) end
         paint()
         if flag then lib:SetFlag(flag, {lo, hi}) end
         if o.Callback then pcall(o.Callback, lo, hi) end
     end
+
     kLo.InputBegan:Connect(function(i)
-        if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+        if i.UserInputType == Enum.UserInputType.MouseButton1
+        or i.UserInputType == Enum.UserInputType.Touch then
             activeHandle = "lo"; update(i)
         end
     end)
     kHi.InputBegan:Connect(function(i)
-        if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+        if i.UserInputType == Enum.UserInputType.MouseButton1
+        or i.UserInputType == Enum.UserInputType.Touch then
             activeHandle = "hi"; update(i)
         end
     end)
-    UIS.InputChanged:Connect(function(i)
-        if activeHandle and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
+    conn(conns, UIS.InputChanged, function(i)
+        if activeHandle and (i.UserInputType == Enum.UserInputType.MouseMovement
+        or i.UserInputType == Enum.UserInputType.Touch) then
             update(i)
         end
     end)
-    UIS.InputEnded:Connect(function(i)
-        if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+    conn(conns, UIS.InputEnded, function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1
+        or i.UserInputType == Enum.UserInputType.Touch then
             activeHandle = nil
         end
     end)
 
+    if flag then
+        lib:OnFlagChanged(flag, function(v)
+            if type(v) == "table" and v[1] and v[2] then
+                lo, hi = v[1], v[2]
+                paint()
+            end
+        end)
+    end
+
     paint()
     return self:_Element(box, o, {
         get = function() return lo, hi end,
-        set = function(v, hi2) lo = v; if hi2 then hi = hi2 end; paint() end,
+        set = function(l, h)
+            lo = snap(l or lo); if h then hi = snap(h) end
+            paint()
+        end,
         refresh = paint,
+        conns = conns,
     })
 end
 
+-- stepper --------------------------------------------------------------
 function Lib:_Stepper(parent, o)
     o = o or {}
     local t = self.Theme
     local lib = self
     local flag = o.Flag or o.Id
-    local val = (o.Default ~= nil) and o.Default or o.Min or 1
+    local val = lib:_GetInitial(flag, (o.Default ~= nil) and o.Default or o.Min or 1)
     local step = o.Step or 1
     local mn, mx = o.Min or 0, o.Max or 100
-    if flag then lib:SetFlag(flag, val) end
+    val = math.clamp(val, mn, mx)
 
     local row = inst("Frame", {
         Size = UDim2.new(1, 0, 0, 36),
@@ -1630,6 +1771,7 @@ function Lib:_Stepper(parent, o)
     })
 end
 
+-- dropdown -------------------------------------------------------------
 function Lib:_Dropdown(parent, o)
     o = o or {}
     local t = self.Theme
@@ -1637,17 +1779,14 @@ function Lib:_Dropdown(parent, o)
     local flag = o.Flag or o.Id
     local multi = o.Multi and true or false
     local searchable = o.Searchable and true or false
-    local current = o.Default
-    if multi then
-        current = current or {}
-        if flag then lib:SetFlag(flag, current) end
-    else
-        current = current or (o.Options and o.Options[1]) or ""
-        if flag then lib:SetFlag(flag, current) end
-    end
+
+    local initial = lib:_GetInitial(flag,
+        multi and {} or (o.Default or (o.Options and o.Options[1]) or ""))
+    local current = initial
+    if multi and type(current) ~= "table" then current = {} end
 
     local opts = {}
-    for i,v in ipairs(o.Options or {}) do opts[i] = v end
+    for i, v in ipairs(o.Options or {}) do opts[i] = v end
 
     local open = false
     local box = inst("Frame", {
@@ -1836,11 +1975,15 @@ function Lib:_Dropdown(parent, o)
 
     return self:_Element(box, o, {
         get = function() return current end,
-        set = function(v) current = v; valLbl.Text = displayValue() end,
+        set = function(v)
+            current = v
+            valLbl.Text = displayValue()
+        end,
         refresh = function() rebuild(); resize() end,
     })
 end
 
+-- text inputs ----------------------------------------------------------
 function Lib:_Textbox(parent, o)
     o = o or {}
     local t = self.Theme
@@ -1855,11 +1998,14 @@ function Lib:_Textbox(parent, o)
     inst("UICorner", {CornerRadius = t.rSm}, box)
     local stroke = inst("UIStroke", {Color = t.border, Thickness = 1, Transparency = 0.4}, box)
 
+    local initial = lib:_GetInitial(flag, o.Default or "")
+    if type(initial) ~= "string" then initial = tostring(initial) end
+
     local tb = inst("TextBox", {
         Size = UDim2.new(1, -28, 1, 0),
         Position = UDim2.fromOffset(14, 0),
         BackgroundTransparency = 1,
-        Text = o.Default or "",
+        Text = initial,
         PlaceholderText = o.Placeholder or o.Title or "type...",
         PlaceholderColor3 = t.textMuted,
         TextColor3 = t.text,
@@ -1875,7 +2021,6 @@ function Lib:_Textbox(parent, o)
     end)
 
     if flag then
-        lib:SetFlag(flag, tb.Text)
         lib:OnFlagChanged(flag, function(v)
             if type(v) == "string" and v ~= tb.Text then tb.Text = v end
         end)
@@ -1893,6 +2038,10 @@ function Lib:_NumberInput(parent, o)
     local lib = self
     local flag = o.Flag or o.Id
 
+    local initial = lib:_GetInitial(flag, o.Default or 0)
+    if type(initial) ~= "number" then initial = tonumber(initial) or 0 end
+    local lastValid = initial
+
     local box = inst("Frame", {
         Size = UDim2.new(1, 0, 0, 36),
         BackgroundColor3 = t.surface,
@@ -1905,7 +2054,7 @@ function Lib:_NumberInput(parent, o)
         Size = UDim2.new(1, -28, 1, 0),
         Position = UDim2.fromOffset(14, 0),
         BackgroundTransparency = 1,
-        Text = tostring(o.Default or 0),
+        Text = tostring(initial),
         PlaceholderText = o.Placeholder or o.Title or "0",
         PlaceholderColor3 = t.textMuted,
         TextColor3 = t.text,
@@ -1916,18 +2065,32 @@ function Lib:_NumberInput(parent, o)
     tb.Focused:Connect(function() stroke.Color = t.accent end)
     tb.FocusLost:Connect(function()
         stroke.Color = t.border
-        local n = tonumber(tb.Text) or 0
+        local n = tonumber(tb.Text)
+        if not n then n = lastValid end
         if o.Min then n = math.max(o.Min, n) end
         if o.Max then n = math.min(o.Max, n) end
         tb.Text = tostring(n)
+        lastValid = n
         if flag then lib:SetFlag(flag, n) end
         if o.Callback then pcall(o.Callback, n) end
     end)
 
-    if flag then lib:SetFlag(flag, tonumber(tb.Text) or 0) end
+    if flag then
+        lib:OnFlagChanged(flag, function(v)
+            if type(v) == "number" and v ~= lastValid then
+                lastValid = v
+                tb.Text = tostring(v)
+            end
+        end)
+    end
+
     return self:_Element(box, o, {
-        get = function() return tonumber(tb.Text) or 0 end,
-        set = function(v) tb.Text = tostring(v) end,
+        get = function() return tonumber(tb.Text) or lastValid end,
+        set = function(v)
+            if type(v) == "number" then
+                tb.Text = tostring(v); lastValid = v
+            end
+        end,
     })
 end
 
@@ -1975,6 +2138,7 @@ function Lib:_SearchInput(parent, o)
     })
 end
 
+-- keybind --------------------------------------------------------------
 function Lib:_Keybind(parent, o)
     o = o or {}
     local t = self.Theme
@@ -1983,6 +2147,16 @@ function Lib:_Keybind(parent, o)
     local mode = o.Mode or "tap"
     local key = o.Default
 
+    local existing = flag and lib:GetFlag(flag)
+    if type(existing) == "string" then
+        for _, k in pairs(Enum.KeyCode:GetEnumItems()) do
+            if k.Name == existing then key = k; break end
+        end
+    elseif flag and not existing then
+        lib:SetFlag(flag, key and key.Name or nil)
+    end
+
+    local conns = {}
     local row = inst("Frame", {
         Size = UDim2.new(1, 0, 0, 36),
         BackgroundColor3 = t.surface,
@@ -2006,7 +2180,7 @@ function Lib:_Keybind(parent, o)
         Position = UDim2.new(1, -92, 0.5, -11),
         BackgroundColor3 = t.surfaceAlt,
         BorderSizePixel = 0,
-        Text = key and tostring(key.Name or key) or "—",
+        Text = key and tostring(key.Name) or "—",
         TextColor3 = t.text,
         Font = t.fm, TextSize = t.fSm,
         AutoButtonColor = false,
@@ -2019,7 +2193,7 @@ function Lib:_Keybind(parent, o)
         chip.Text = "press..."
     end)
 
-    UIS.InputBegan:Connect(function(input, gp)
+    conn(conns, UIS.InputBegan, function(input, gp)
         if listening then
             listening = false
             key = input.KeyCode
@@ -2033,7 +2207,7 @@ function Lib:_Keybind(parent, o)
         end
     end)
     if mode == "hold" then
-        UIS.InputEnded:Connect(function(input)
+        conn(conns, UIS.InputEnded, function(input)
             if key and input.KeyCode == key then
                 if o.OnRelease then pcall(o.OnRelease, key) end
             end
@@ -2041,7 +2215,6 @@ function Lib:_Keybind(parent, o)
     end
 
     if flag then
-        lib:SetFlag(flag, key and key.Name or nil)
         lib:OnFlagChanged(flag, function(v)
             if type(v) == "string" then
                 for _, k in pairs(Enum.KeyCode:GetEnumItems()) do
@@ -2050,6 +2223,7 @@ function Lib:_Keybind(parent, o)
             end
         end)
     end
+
     return self:_Element(row, o, {
         get = function() return key end,
         set = function(v)
@@ -2061,17 +2235,20 @@ function Lib:_Keybind(parent, o)
             end
             chip.Text = key and tostring(key.Name) or "—"
         end,
+        conns = conns,
     })
 end
 
+-- color picker ---------------------------------------------------------
 function Lib:_ColorPicker(parent, o)
     o = o or {}
     local t = self.Theme
     local lib = self
     local flag = o.Flag or o.Id
-    local current = o.Default or Color3.new(1, 1, 1)
-    if flag then lib:SetFlag(flag, current) end
+    local current = lib:_GetInitial(flag, o.Default or Color3.new(1, 1, 1))
+    if typeof(current) ~= "Color3" then current = Color3.new(1, 1, 1) end
 
+    local conns = {}
     local box = inst("Frame", {
         Size = UDim2.new(1, 0, 0, 160),
         BackgroundColor3 = t.surface,
@@ -2102,7 +2279,7 @@ function Lib:_ColorPicker(parent, o)
     local hsv = inst("Frame", {
         Size = UDim2.new(1, -24, 0, 100),
         Position = UDim2.fromOffset(12, 30),
-        BackgroundColor3 = Color3.fromRGB(255, 0, 0),
+        BackgroundColor3 = Color3.new(1, 0, 0),
         BorderSizePixel = 0,
         ClipsDescendants = true,
     }, box)
@@ -2114,10 +2291,7 @@ function Lib:_ColorPicker(parent, o)
         BorderSizePixel = 0,
     }, hsv)
     inst("UIGradient", {
-        Color = ColorSequence.new({
-            ColorSequenceKeypoint.new(0, Color3.new(1, 1, 1)),
-            ColorSequenceKeypoint.new(1, Color3.new(1, 1, 1)),
-        }),
+        Color = ColorSequence.new(Color3.new(1, 1, 1)),
         Transparency = NumberSequence.new({
             NumberSequenceKeypoint.new(0, 0),
             NumberSequenceKeypoint.new(1, 1),
@@ -2127,20 +2301,20 @@ function Lib:_ColorPicker(parent, o)
 
     local valOverlay = inst("Frame", {
         Size = UDim2.fromScale(1, 1),
-        BackgroundColor3 = Color3.new(1, 1, 1),
+        BackgroundColor3 = Color3.new(0, 0, 0),
         BorderSizePixel = 0,
     }, hsv)
     inst("UIGradient", {
-        Color = ColorSequence.new({
-            ColorSequenceKeypoint.new(0, Color3.new(0, 0, 0)),
-            ColorSequenceKeypoint.new(1, Color3.new(1, 1, 1)),
+        Color = ColorSequence.new(Color3.new(0, 0, 0)),
+        Transparency = NumberSequence.new({
+            NumberSequenceKeypoint.new(0, 0),
+            NumberSequenceKeypoint.new(1, 1),
         }),
         Rotation = 90,
     }, valOverlay)
 
     local svKnob = inst("Frame", {
         Size = UDim2.fromOffset(10, 10),
-        Position = UDim2.new(1, -5, 0, -5),
         BackgroundColor3 = Color3.new(1, 1, 1),
         BorderSizePixel = 0,
         ZIndex = 2,
@@ -2170,7 +2344,6 @@ function Lib:_ColorPicker(parent, o)
 
     local hKnob = inst("Frame", {
         Size = UDim2.fromOffset(10, 16),
-        Position = UDim2.new(0, -5, 0.5, -8),
         BackgroundColor3 = Color3.new(1, 1, 1),
         BorderSizePixel = 0,
         ZIndex = 2,
@@ -2178,7 +2351,7 @@ function Lib:_ColorPicker(parent, o)
     inst("UICorner", {CornerRadius = UDim.new(0, 3)}, hKnob)
     inst("UIStroke", {Color = Color3.new(0, 0, 0), Thickness = 1}, hKnob)
 
-    local hue, s, v = 0, 1, 1
+    local hue, s, v = Color3.toHSV(current)
 
     local function paint(noFlag)
         current = Color3.fromHSV(hue, s, v)
@@ -2187,7 +2360,7 @@ function Lib:_ColorPicker(parent, o)
         svKnob.Position = UDim2.new(s, -5, 1 - v, -5)
         hKnob.Position = UDim2.new(hue, -5, 0.5, -8)
         if flag and not noFlag then lib:SetFlag(flag, current) end
-        if o.Callback then pcall(o.Callback, current) end
+        if o.Callback and not noFlag then pcall(o.Callback, current) end
     end
 
     local draggingSV, draggingHue
@@ -2198,27 +2371,32 @@ function Lib:_ColorPicker(parent, o)
         paint()
     end
     hsv.InputBegan:Connect(function(i)
-        if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+        if i.UserInputType == Enum.UserInputType.MouseButton1
+        or i.UserInputType == Enum.UserInputType.Touch then
             draggingSV = true; updateSV(i)
         end
     end)
     hueBar.InputBegan:Connect(function(i)
-        if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+        if i.UserInputType == Enum.UserInputType.MouseButton1
+        or i.UserInputType == Enum.UserInputType.Touch then
             draggingHue = true
             hue = math.clamp((i.Position.X - hueBar.AbsolutePosition.X) / hueBar.AbsoluteSize.X, 0, 1)
             paint()
         end
     end)
-    UIS.InputChanged:Connect(function(i)
-        if draggingSV and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
+    conn(conns, UIS.InputChanged, function(i)
+        if draggingSV and (i.UserInputType == Enum.UserInputType.MouseMovement
+        or i.UserInputType == Enum.UserInputType.Touch) then
             updateSV(i)
-        elseif draggingHue and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
+        elseif draggingHue and (i.UserInputType == Enum.UserInputType.MouseMovement
+        or i.UserInputType == Enum.UserInputType.Touch) then
             hue = math.clamp((i.Position.X - hueBar.AbsolutePosition.X) / hueBar.AbsoluteSize.X, 0, 1)
             paint()
         end
     end)
-    UIS.InputEnded:Connect(function(i)
-        if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+    conn(conns, UIS.InputEnded, function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1
+        or i.UserInputType == Enum.UserInputType.Touch then
             draggingSV = false; draggingHue = false
         end
     end)
@@ -2242,9 +2420,11 @@ function Lib:_ColorPicker(parent, o)
             paint()
         end,
         refresh = function() paint(true) end,
+        conns = conns,
     })
 end
 
+-- progress / code ------------------------------------------------------
 function Lib:_ProgressBar(parent, o)
     o = o or {}
     local t = self.Theme
@@ -2277,7 +2457,7 @@ function Lib:_ProgressBar(parent, o)
     end
     inst("UICorner", {CornerRadius = UDim.new(1, 0)}, bg)
     local fill = inst("Frame", {
-        Size = UDim2.new(o.Default or 0, 0, 1, 0),
+        Size = UDim2.new(math.clamp(o.Default or 0, 0, 1), 0, 1, 0),
         BackgroundColor3 = o.Color or t.accent,
         BorderSizePixel = 0,
     }, bg)
